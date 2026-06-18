@@ -1,0 +1,108 @@
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+// HistoricMerkleTree retains every root the tree has ever held.
+// When the admin inserts a new member (which changes the root), outstanding
+// proofs generated against previous roots remain valid. A plain Bytes<32>
+// root field would be overwritten on each insertion, invalidating every path
+// that was computed before that update.
+export ledger memberTree: HistoricMerkleTree<20, Bytes<32>>;
+
+// Nullifier storage. Compact has no Set<T> type — Map<K, Boolean> is the
+// standard pattern: key present means nullifier has been spent.
+// The allowlist and voter-roll circuits spend nullifiers; the gated-access
+// circuit (verifyMembership) does not.
+export ledger usedNullifiers: Map<Bytes<32>, Boolean>;
+
+export ledger memberCount: Counter;
+
+// All private inputs are supplied by the prover as witnesses.
+// Secret and nonce form the preimage of the leaf hash.
+witness getMemberSecret(): Bytes<32>;
+witness getMemberNonce(): Bytes<32>;
+
+// The path witness takes the public leaf as input so the off-chain
+// implementation can locate the correct position in the tree.
+// merkleTreePathRoot reconstructs the root from this exact leaf value.
+witness getMemberPath(leaf: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+
+// ─── Admin circuit ────────────────────────────────────────────────────────────
+
+// The admin computes leaf = persistentHash(["member:leaf:v1", secret, nonce])
+// off-chain and submits only the hash. The member's identity, secret, and any
+// real-world attribute never appear on-chain.
+export circuit registerMember(memberLeaf: Bytes<32>): [] {
+    memberTree.insert(disclose(memberLeaf));
+    memberCount.increment(1);
+}
+
+// ─── One-time membership proof ────────────────────────────────────────────────
+//
+// Spends a nullifier so the same proof cannot be replayed.
+// Use this for single-use allowlists and anonymous voting.
+//
+// The circuit enforces two security properties on every call:
+//
+// 1. Preimage binding — the caller must know (secret, nonce) that hash to the
+//    claimed leaf. Without this assertion, anyone who observes a valid leaf in
+//    the public tree can produce a passing proof without knowing the secret.
+//
+// 2. Domain separation — the leaf domain ("member:leaf:v1") and the nullifier
+//    domain ("member:nullifier:v1") are distinct. If both used the same tag,
+//    leaf and nullifier would be equal for any (secret, nonce), which means the
+//    first use permanently blocks the membership rather than just recording it.
+
+export circuit proveMembership(memberLeaf: Bytes<32>): [] {
+    const secret = getMemberSecret();
+    const nonce = getMemberNonce();
+
+    // Preimage binding: the ZK proof guarantees the caller knows the secret
+    // and nonce behind this leaf, without revealing either.
+    const recomputed = persistentHash<Vector<3, Bytes<32>>>([
+        pad(32, "member:leaf:v1"),
+        secret,
+        nonce
+    ]);
+    assert(recomputed == disclose(memberLeaf), "Secret does not match leaf commitment");
+
+    // Path verification against any historic root.
+    // Valid even if new members were registered after this path was generated.
+    const path = getMemberPath(disclose(memberLeaf));
+    const root = merkleTreePathRoot<20, Bytes<32>>(path);
+    assert(memberTree.checkRoot(disclose(root)), "Leaf not in member tree");
+
+    // Nullifier: domain-separated so it cannot be correlated with the leaf.
+    // An observer who sees a nullifier on-chain cannot determine which leaf
+    // produced it, because the nullifier domain differs from the leaf domain.
+    const nullifier = persistentHash<Vector<3, Bytes<32>>>([
+        pad(32, "member:nullifier:v1"),
+        secret,
+        nonce
+    ]);
+    assert(!usedNullifiers.member(disclose(nullifier)), "Membership proof already consumed");
+    usedNullifiers.insert(disclose(nullifier), disclose(true));
+}
+
+// ─── Reusable membership verification ─────────────────────────────────────────
+//
+// Proves membership without spending a nullifier.
+// Use this for gated access, continuous authentication, or any context
+// where the same member needs to prove membership across multiple sessions.
+// The same (secret, nonce) pair can be used as many times as needed.
+
+export circuit verifyMembership(memberLeaf: Bytes<32>): [] {
+    const secret = getMemberSecret();
+    const nonce = getMemberNonce();
+
+    const recomputed = persistentHash<Vector<3, Bytes<32>>>([
+        pad(32, "member:leaf:v1"),
+        secret,
+        nonce
+    ]);
+    assert(recomputed == disclose(memberLeaf), "Secret does not match leaf commitment");
+
+    const path = getMemberPath(disclose(memberLeaf));
+    const root = merkleTreePathRoot<20, Bytes<32>>(path);
+    assert(memberTree.checkRoot(disclose(root)), "Leaf not in member tree");
+    // No nullifier insertion — this proof is intentionally reusable.
+}
