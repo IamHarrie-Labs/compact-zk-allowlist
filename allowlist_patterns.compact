@@ -10,13 +10,13 @@ import CompactStandardLibrary;
 
 // ─── All ledger and witness declarations ─────────────────────────────────────
 
-// Pattern 1 — Manual root storage (breaks outstanding proofs on each insertion)
-export ledger manualRoot: Bytes<32>;
-export ledger manualNullifiers: Map<Bytes<32>, Boolean>;
+// Pattern 1 — Predictable nullifier derived from public data
+export ledger dangerousTree: HistoricMerkleTree<20, Bytes<32>>;
+export ledger dangerousNullifiers: Map<Bytes<32>, Boolean>;
 
-witness getManualSecret(): Bytes<32>;
-witness getManualNonce(): Bytes<32>;
-witness getManualPath(leaf: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+witness getDangerousSecret(): Bytes<32>;
+witness getDangerousNonce(): Bytes<32>;
+witness getDangerousPath(leaf: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
 
 // Pattern 2 — Same domain tag for leaf and nullifier
 export ledger sameDomainTree: HistoricMerkleTree<20, Bytes<32>>;
@@ -34,74 +34,74 @@ witness getNoBindingSecret(): Bytes<32>;
 witness getNoBindingNonce(): Bytes<32>;
 witness getNoBindingPath(leaf: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
 
-// ─── Pattern 1: Manual root (dangerous) ──────────────────────────────────────
+// ─── Pattern 1: Predictable nullifier (dangerous) ─────────────────────────────
 //
-// When the admin stores a single Bytes<32> root and overwrites it each time
-// a new member is added, every existing Merkle path becomes stale.
+// If the nullifier is derived from the PUBLIC memberLeaf circuit parameter
+// rather than the PRIVATE (secret, nonce) witnesses, any mempool observer can
+// predict the nullifier before the member's transaction is confirmed.
 //
-// Scenario: Alice generates a path to root R1. The admin then adds Bob,
-// producing root R2. The on-chain root is now R2. Alice's path still
-// leads to R1 — the assert below fails, not because Alice isn't a member,
-// but because the root changed underneath her.
+// Attack: Bob watches the mempool, sees Alice submitting proveMembership with
+// leaf L. He computes H("member:nullifier:v1" || L), then submits a transaction
+// that inserts that nullifier into usedNullifiers. If Bob's transaction lands
+// first, Alice's proof fails with "already consumed" — and Alice can never use
+// her membership slot again, because the nullifier is permanently spent.
 //
-// Alice must regenerate her entire Merkle path every time ANY member is added,
-// even though her own position in the tree has not changed.
-//
-// Fix: use HistoricMerkleTree — checkRoot accepts any root the tree has ever
-// held, so Alice's path remains valid regardless of subsequent insertions.
+// The fix is to bind the nullifier to the PRIVATE (secret, nonce) pair, which
+// nobody in the mempool can observe.
 
-export circuit dangerousSetRoot(newRoot: Bytes<32>): [] {
-    // ❌ DANGEROUS: replaces the only stored root.
-    // All existing membership proofs fail immediately after this call.
-    manualRoot.write(disclose(newRoot));
-}
-
-export circuit dangerousManualProve(memberLeaf: Bytes<32>): [] {
-    const secret = getManualSecret();
-    const nonce = getManualNonce();
+export circuit dangerousPredictableNullifier(memberLeaf: Bytes<32>): [] {
+    const secret = getDangerousSecret();
+    const nonce = getDangerousNonce();
 
     const recomputed = persistentHash<Vector<3, Bytes<32>>>([
         pad(32, "member:leaf:v1"), secret, nonce
     ]);
     assert(recomputed == disclose(memberLeaf), "Preimage mismatch");
 
-    const path = getManualPath(disclose(memberLeaf));
+    const path = getDangerousPath(disclose(memberLeaf));
     const root = merkleTreePathRoot<20, Bytes<32>>(path);
+    assert(dangerousTree.checkRoot(disclose(root)), "Not in tree");
 
-    // ❌ DANGEROUS: only the current root is stored on-chain.
-    // Fails for any member whose path was generated before the last insertion.
-    assert(disclose(root) == manualRoot.read(), "Stale proof — root has changed since path was generated");
-
-    const nullifier = persistentHash<Vector<3, Bytes<32>>>([
-        pad(32, "member:nullifier:v1"), secret, nonce
+    // ❌ DANGEROUS: nullifier = H(domain || memberLeaf).
+    // memberLeaf is a PUBLIC circuit parameter visible in the mempool.
+    // An observer can compute this nullifier before the transaction is confirmed
+    // and front-run it to permanently block Alice's proof.
+    const nullifier = persistentHash<Vector<2, Bytes<32>>>([
+        pad(32, "member:nullifier:v1"),
+        memberLeaf
     ]);
-    assert(!manualNullifiers.member(disclose(nullifier)), "Already used");
-    manualNullifiers.insert(disclose(nullifier), disclose(true));
+    assert(!dangerousNullifiers.member(disclose(nullifier)), "Already consumed");
+    dangerousNullifiers.insert(disclose(nullifier), disclose(true));
 }
+
+// ✅ SAFE: bind the nullifier to PRIVATE (secret, nonce) — unpredictable to observers
+// const nullifier = persistentHash<Vector<3, Bytes<32>>>([
+//     pad(32, "member:nullifier:v1"), secret, nonce
+// ]);
 
 // ─── Pattern 2: Same domain for leaf and nullifier (dangerous) ───────────────
 //
 // When the leaf hash and the nullifier hash share a domain tag, they produce
 // identical output for any (secret, nonce) pair.
 //
-// Result: the leaf the admin inserts equals Alice's nullifier. The first
-// time Alice calls this circuit, her "nullifier" is already the leaf value —
-// it happens to be in the tree, not in the nullifiers map, so it passes.
-// But the circuit then inserts that leaf value into sameDomainNullifiers.
-// On any second call, the same-domain nullifier is already present and the
-// proof fails — Alice is permanently locked out after one use, with no
-// way to distinguish "proof already spent" from "leaf collision".
+// Result: the leaf the admin inserts equals Alice's nullifier. The first time
+// Alice calls this circuit, her "nullifier" is already her leaf value — which
+// is in the tree, not in sameDomainNullifiers, so the membership check passes.
+// The circuit then inserts that leaf value into sameDomainNullifiers.
+// On any subsequent call, the same-domain nullifier is already present and the
+// proof fails with "already consumed" — permanently locking Alice out after
+// one use, with no way to distinguish replay prevention from domain collision.
 
 export circuit dangerousSameDomainProve(memberLeaf: Bytes<32>): [] {
     const secret = getSameSecret();
     const nonce = getSameNonce();
 
-    // ❌ DANGEROUS: both leaf and nullifier use "member:leaf:v1"
+    // ❌ DANGEROUS: both hashes use "member:leaf:v1" — output is identical
     const leaf = persistentHash<Vector<3, Bytes<32>>>([
         pad(32, "member:leaf:v1"), secret, nonce
     ]);
     const nullifier = persistentHash<Vector<3, Bytes<32>>>([
-        pad(32, "member:leaf:v1"),   // ← same tag as leaf — output is identical
+        pad(32, "member:leaf:v1"),   // ← same tag as leaf
         secret, nonce
     ]);
 
@@ -111,12 +111,12 @@ export circuit dangerousSameDomainProve(memberLeaf: Bytes<32>): [] {
     const root = merkleTreePathRoot<20, Bytes<32>>(path);
     assert(sameDomainTree.checkRoot(disclose(root)), "Not in tree");
 
-    // nullifier == leaf for every possible input.
-    assert(!sameDomainNullifiers.member(disclose(nullifier)), "Already used");
+    // nullifier == leaf for every possible (secret, nonce).
+    assert(!sameDomainNullifiers.member(disclose(nullifier)), "Already consumed");
     sameDomainNullifiers.insert(disclose(nullifier), disclose(true));
 }
 
-// ✅ SAFE: use distinct domains.
+// ✅ SAFE: distinct domains
 // leaf      = persistentHash(["member:leaf:v1",      secret, nonce])
 // nullifier = persistentHash(["member:nullifier:v1", secret, nonce])
 
@@ -130,10 +130,8 @@ export circuit dangerousSameDomainProve(memberLeaf: Bytes<32>): [] {
 // contents are public state). They supply that leaf as the circuit parameter,
 // compute a valid Merkle path for it from public data, and supply any
 // (secret, nonce) they control to produce a nullifier. The circuit accepts
-// because nothing binds those private inputs to the claimed leaf.
-//
-// The attacker can prove membership in someone else's allowlist slot without
-// knowing that person's secret.
+// because nothing checks that their (secret, nonce) pair hashes to the
+// claimed leaf. The attacker proves membership in a slot they do not own.
 
 export circuit dangerousNoBinding(memberLeaf: Bytes<32>): [] {
     const secret = getNoBindingSecret();
@@ -151,7 +149,7 @@ export circuit dangerousNoBinding(memberLeaf: Bytes<32>): [] {
     const nullifier = persistentHash<Vector<3, Bytes<32>>>([
         pad(32, "member:nullifier:v1"), secret, nonce
     ]);
-    assert(!noBindingNullifiers.member(disclose(nullifier)), "Already used");
+    assert(!noBindingNullifiers.member(disclose(nullifier)), "Already consumed");
     noBindingNullifiers.insert(disclose(nullifier), disclose(true));
 }
 
